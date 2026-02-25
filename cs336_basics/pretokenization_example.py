@@ -75,12 +75,14 @@ with open(r"E:\桌面\cs336\assignment1-basics-main\data\TinyStoriesV2-GPT4-vali
 
         for segment in segments:
             for match in pattern.finditer(segment):
-                token = tuple(match.group())
-                pretoken_counts[token] += 1
+                token_str = match.group()
+                token_bytes = token_str.encode('utf-8')
+                token_tuple = tuple(bytes([b]) for b in token_bytes)
+                pretoken_counts[token_tuple] += 1
 
-                if len(token) >= 2:
-                    for i in range(len(token) - 1):
-                        pair = (token[i], token[i+1])
+                if len(token_tuple) >= 2:
+                    for i in range(len(token_tuple) - 1):
+                        pair = (token_tuple[i], token_tuple[i+1])
                         byte_pair_counts[pair] += 1
         # Run pre-tokenization on your chunk and store the counts for each pre-token
 print("Pre-token counts (sample):", list(pretoken_counts.items())[:10])

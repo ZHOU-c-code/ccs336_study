@@ -1,0 +1,226 @@
+import os
+import heapq
+import multiprocessing as mp
+from collections import Counter
+from typing import Dict, List, Tuple, Optional
+import regex as re
+
+PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+
+def find_chunk_boundaries(
+    file,
+    desired_num_chunks: int,
+    split_special_token: Optional[bytes] = None,
+) -> list[int]:
+    """
+    Chunk the file into parts that can be counted independently.
+    May return fewer chunks if the boundaries end up overlapping.
+    """
+    assert isinstance(split_special_token, bytes) or split_special_token is None, "Must represent special token as a bytestring"
+
+    file.seek(0, os.SEEK_END)
+    file_size = file.tell()
+    file.seek(0)
+
+    chunk_size = file_size // desired_num_chunks
+
+    chunk_boundaries = [i * chunk_size for i in range(desired_num_chunks + 1)]
+    chunk_boundaries[-1] = file_size
+    if split_special_token is None:
+        return chunk_boundaries
+
+    mini_chunk_size = 4096
+
+    for bi in range(1, len(chunk_boundaries) - 1):
+        initial_position = chunk_boundaries[bi]
+        file.seek(initial_position)
+        while True:
+            mini_chunk = file.read(mini_chunk_size)
+
+            if mini_chunk == b"":
+                chunk_boundaries[bi] = file_size
+                break
+
+            found_at = mini_chunk.find(split_special_token)
+            if found_at != -1:
+                chunk_boundaries[bi] = initial_position + found_at
+                break
+            initial_position += mini_chunk_size
+
+    return sorted(set(chunk_boundaries))
+
+def process_chunk(
+    file_path: str,
+    start: int,
+    end: int,
+    chunk_id: int,
+    special_tokens: List[str],
+    pat: str
+) -> Dict:
+    """
+    Process a single chunk: decode, split on special tokens, pre-tokenize,
+    and count pre-tokens as tuples of bytes.
+    """
+    if special_tokens:
+        escaped_tokens = [re.escape(token) for token in special_tokens]
+        delimiter_pattern = re.compile("|".join(escaped_tokens))
+    else:
+        delimiter_pattern = None
+    token_pattern = re.compile(pat, flags=re.UNICODE)
+    pretoken_counts = Counter()
+
+    with open(file_path, 'rb') as f:
+        f.seek(start)
+        chunk_data = f.read(end - start).decode("utf-8", errors="ignore")
+
+    if delimiter_pattern:
+        segments = delimiter_pattern.split(chunk_data)
+        full_segments = [seg for seg in segments if seg]
+    else:
+        full_segments = [chunk_data]
+
+    for segment in full_segments:
+        for match in token_pattern.finditer(segment):
+            token_str = match.group()
+            # Each character -> its UTF-8 bytes
+            token_bytes = token_str.encode('utf-8')
+            token_tuple = tuple(bytes([b]) for b in token_bytes)
+            pretoken_counts[token_tuple] += 1
+
+    return {
+        'tokens': dict(pretoken_counts),
+        'chunk_id': chunk_id
+    }
+
+
+def train_bpe_tokenizer(
+    input_path: str,
+    vocab_size: int,
+    special_tokens: Optional[List[str]] = None,
+    num_processes: int = None
+) -> Tuple[Dict[int, bytes], List[Tuple[bytes, bytes]]]:
+    """
+    BPE training using bytes internally.
+    Uses single-process pre-tokenization for correctness, then iterative merging.
+    """
+    if special_tokens is None:
+        special_tokens = []
+    
+    if num_processes is None:
+        num_processes = mp.cpu_count()
+
+    # Step 1: Read and pre-tokenize the entire corpus
+    use_special_chunking = False
+    if "<|endoftext|>" in special_tokens:
+        # 快速检查文件中是否有这个token
+        with open(input_path, 'rb') as f:
+            sample = f.read(1024 * 1024)  # 读1MB
+            if b"<|endoftext|>" in sample:
+                use_special_chunking = True
+
+    with open(input_path, 'rb') as f:
+        if use_special_chunking:
+            boundaries = find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
+        else:
+            boundaries = find_chunk_boundaries(f, num_processes)
+    #print(boundaries)
+    # Step 2: Initialize vocabulary
+    vocab = {i: bytes([i]) for i in range(256)}
+    next_id = 256
+    vocab_set = set(vocab.values())
+    for token in special_tokens:
+        token_bytes = token.encode('utf-8')
+        if token_bytes not in vocab_set:
+            vocab[next_id] = token_bytes
+            vocab_set.add(token_bytes)
+            next_id += 1
+
+    # Step 3: Initial parallel processing to get token positions        
+    #print("Initial tokenization and pair counting...")
+    # Process chunks to get initial token sequences and pair positions
+    with mp.Pool(processes=num_processes) as pool:
+        chunk_args = [(input_path, boundaries[i], boundaries[i+1], i, special_tokens, PAT)
+                      for i in range(len(boundaries) - 1)]
+        results = pool.starmap(process_chunk, chunk_args)
+
+    word_counts = Counter()
+    for res in results:
+        word_counts.update(res['tokens'])   
+    pair_counts = Counter()
+    for word, freq in word_counts.items():
+        if len(word) == 1:
+            continue
+        for i in range(len(word) - 1):
+            pair = (word[i], word[i+1])
+            pair_counts[pair] += freq
+
+    # Step 4: Perform merges
+    merges = []
+    ##不用堆，用其他数据结构
+    while len(vocab) < vocab_size and pair_counts:
+        #neg_count, best_pair = heapq.heappop(pair_heap)
+        #count = -neg_count
+        count, best_pair=max((count, pair) for pair, count in pair_counts.items())
+        if pair_counts.get(best_pair, 0) != count or count == 0:
+            continue
+
+        token1, token2 = best_pair
+        new_token = token1 + token2
+
+        if new_token not in vocab_set:
+            vocab[next_id] = new_token
+            vocab_set.add(new_token)
+            next_id += 1
+
+        #merges.append((token1, token2,pair_counts[best_pair]))
+        merges.append((token1, token2))
+
+        # Find affected words
+        words_to_process = list(word_counts.items())
+        for word, freq in words_to_process:
+            # Check if word contains the best_pair
+            # Build new word by replacing all occurrences of the pair
+            new_word = []
+            i = 0
+            changed = False
+            while i < len(word):
+                if i < len(word) - 1 and word[i] == token1 and word[i+1] == token2:
+                    new_word.append(new_token)
+                    i += 2
+                    changed = True
+                else:
+                    new_word.append(word[i])
+                    i += 1
+            if not changed:
+                continue
+
+            new_word_tuple = tuple(new_word)
+
+            # Update word_counts
+            word_counts[word] -= freq
+            if word_counts[word] == 0:
+                del word_counts[word]
+            word_counts[new_word_tuple] += freq
+
+            # Update pair_counts: remove old pairs, add new pairs
+            # Old pairs
+            for j in range(len(word) - 1):
+                p = (word[j], word[j+1])
+                pair_counts[p] -= freq
+                if pair_counts[p] == 0:
+                    del pair_counts[p]
+            # New pairs
+            for j in range(len(new_word_tuple) - 1):
+                p = (new_word_tuple[j], new_word_tuple[j+1])
+                pair_counts[p] += freq
+
+    return vocab, merges
+
+
+if __name__ == "__main__":
+    train_txt_path = r"E:\桌面\cs336\assignment1-basics-main\tests\fixtures\corpus.en"
+    vocab_size = 500
+    special_tokens = ["<|endoftext|>"]
+    vocab, merges = train_bpe_tokenizer(train_txt_path, vocab_size, special_tokens, num_processes=4)
+    for i, merge in enumerate(merges[:95]):
+        print(f"Merge {i+1}: {merge}")

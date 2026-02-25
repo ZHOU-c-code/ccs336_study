@@ -18,20 +18,18 @@ def find_chunk_boundaries(
     """
     assert isinstance(split_special_token, bytes), "Must represent special token as a bytestring"
 
-    # Get total file size in bytes
     file.seek(0, os.SEEK_END)
     file_size = file.tell()
     file.seek(0)
 
     chunk_size = file_size // desired_num_chunks
 
-    # Initial guesses for chunk boundary locations, uniformly spaced
     chunk_boundaries = [i * chunk_size for i in range(desired_num_chunks + 1)]
     chunk_boundaries[-1] = file_size
     if split_special_token is None:
         return chunk_boundaries
 
-    mini_chunk_size = 4096  # Read ahead by 4k bytes at a time
+    mini_chunk_size = 4096
 
     for bi in range(1, len(chunk_boundaries) - 1):
         initial_position = chunk_boundaries[bi]
@@ -61,10 +59,9 @@ def process_chunk(
 ) -> Dict:
     """
     Process a single chunk: decode, split on special tokens, pre-tokenize,
-    and count pre-tokens and byte pairs.
+    and count pre-tokens as tuples of bytes.
     """
     if special_tokens:
-        # 转义特殊标记以用于正则表达式
         escaped_tokens = [re.escape(token) for token in special_tokens]
         delimiter_pattern = re.compile("|".join(escaped_tokens))
     else:
@@ -75,17 +72,14 @@ def process_chunk(
     with open(file_path, 'rb') as f:
         f.seek(start)
         chunk_data = f.read(end - start).decode("utf-8", errors="ignore")
-       
+
     if delimiter_pattern:
-        # 按特殊标记分割，将它们作为单独的段
         segments = delimiter_pattern.split(chunk_data)
-        # 将特殊标记作为它们自己的段添加回来
         special_matches = delimiter_pattern.findall(chunk_data)
-        
-        # 交织段和特殊标记
+
         full_segments = []
         for i, segment in enumerate(segments):
-            if segment:  # 跳过空段
+            if segment:
                 full_segments.append(segment)
             if i < len(special_matches):
                 full_segments.append(special_matches[i])
@@ -245,7 +239,7 @@ def train_bpe_tokenizer(
 
 
 if __name__ == "__main__":
-    train_txt_path=r"E:\桌面\cs336\assignment1-basics-main\data\TinyStoriesV2-GPT4-valid.txt"
+    train_txt_path=r"E:\桌面\cs336\assignment1-basics-main\tests\fixtures\corpus.en"
     vocab_size=512
     special_tokens = ["<|endoftext|>"]
     vocab, merges = train_bpe_tokenizer(train_txt_path, vocab_size, special_tokens, num_processes=4)

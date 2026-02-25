@@ -8,7 +8,7 @@ import numpy.typing as npt
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
-from cs336_basics.hw_BPE import train_bpe_tokenizer
+from cs336_basics.hw_BPE_Claude import train_bpe_tokenizer
 
 def run_linear(
     d_in: int,
@@ -287,7 +287,7 @@ def run_transformer_lm(
     weights: dict[str, Tensor],
     in_indices: Int[Tensor, " batch_size sequence_length"],
 ) -> Float[Tensor, " batch_size sequence_length vocab_size"]:
-    """Given the weights of a Transformer language model and input indices,
+    """Given the weights of a Transformer language model and input indices
     return the output of running a forward pass on the input indices.
 
     This function should use RoPE.
@@ -592,14 +592,13 @@ def run_train_bpe(
     """
     
     input_path = str(input_path)
-    num_processes = kwargs.get('num_processes', None)
+    num_processes = 4
     vocab, merges = train_bpe_tokenizer(
         input_path=input_path,
         vocab_size=vocab_size,
         special_tokens=special_tokens,
         num_processes=num_processes   # 可传递 num_processes 等额外参数
     )
-    
 
     return vocab, merges
     raise NotImplementedError

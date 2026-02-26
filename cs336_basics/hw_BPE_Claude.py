@@ -121,10 +121,9 @@ def train_bpe_tokenizer(
 
     with open(input_path, 'rb') as f:
         if use_special_chunking:
-            boundaries = find_chunk_boundaries(f, 2*num_processes, b"<|endoftext|>")
+            boundaries = find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
         else:
-            boundaries = find_chunk_boundaries(f, 2*num_processes)
-    print(f"Created {len(boundaries)-1} chunks for {num_processes} processes")
+            boundaries = find_chunk_boundaries(f, num_processes)
     # Step 2: Initialize vocabulary
     vocab = {i: bytes([i]) for i in range(256)}
     next_id = 256

@@ -5,6 +5,7 @@ from typing import Dict, List, Tuple, Optional
 import regex as re
 import cProfile
 import pstats
+import heapq
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
@@ -157,14 +158,28 @@ def train_bpe_tokenizer(
 
     # Step 4: Perform merges
     merges = []
-    ##不用堆，用其他数据结构
-    while len(vocab) < vocab_size and pair_counts:
-        #neg_count, best_pair = heapq.heappop(pair_heap)
-        #count = -neg_count
-        #直接max的方法
-        count, best_pair=max((count, pair) for pair, count in pair_counts.items()) 
-        if pair_counts.get(best_pair, 0) != count or count == 0:
-            continue
+    pair_heap = [(-count, pair) for pair, count in pair_counts.items()]
+    heapq.heapify(pair_heap)
+    pair_counts_active = pair_counts.copy()
+    merge_count = 0
+    while len(vocab) < vocab_size and pair_heap:
+        merge_count += 1
+        while pair_heap:
+            neg_count, best_pair = pair_heap[0]  # 只看不pop
+            current_count = pair_counts_active.get(best_pair, 0)
+            
+            # 如果堆顶的值和当前实际值一致，说明有效
+            if current_count == -neg_count and current_count > 0:
+                break
+            else:
+                # 过期了，pop掉
+                heapq.heappop(pair_heap)       
+        # 如果没有有效元素了，退出
+        if not pair_heap:
+            break
+
+        neg_count, best_pair = heapq.heappop(pair_heap)
+        count = -neg_count
 
         token1, token2 = best_pair
         new_token = token1 + token2
@@ -178,21 +193,32 @@ def train_bpe_tokenizer(
         merges.append((token1, token2))
 
         # Find affected words
+        pairs_to_update = set()
         words_to_process = list(word_counts.items())
         for word, freq in words_to_process:
-            # Check if word contains the best_pair
-            # Build new word by replacing all occurrences of the pair
+            if freq == 0:
+                continue
+            
+            # 快速检查这个词是否包含这个pair
+            # 优化：如果token1不在word中，肯定不包含这个pair
+            if token1 not in word:
+                continue
+            
+            # 构建新词
             new_word = []
             i = 0
             changed = False
-            while i < len(word):
-                if i < len(word) - 1 and word[i] == token1 and word[i+1] == token2:
+            word_len = len(word)  # 缓存长度
+            
+            while i < word_len:
+                if i < word_len - 1 and word[i] == token1 and word[i+1] == token2:
                     new_word.append(new_token)
                     i += 2
                     changed = True
                 else:
                     new_word.append(word[i])
                     i += 1
+            
             if not changed:
                 continue
 
@@ -208,14 +234,25 @@ def train_bpe_tokenizer(
             # Old pairs
             for j in range(len(word) - 1):
                 p = (word[j], word[j+1])
-                pair_counts[p] -= freq
-                if pair_counts[p] == 0:
-                    del pair_counts[p]
+                old_count = pair_counts_active.get(p, 0)
+                new_count = old_count - freq
+                
+                if new_count > 0:
+                    pair_counts_active[p] = new_count
+                    # 推入新值（旧值会留在堆中，后面会被跳过）
+                    heapq.heappush(pair_heap, (-new_count, p))
+                else:
+                    # 如果count变为0，从active字典中删除
+                    if p in pair_counts_active:
+                        del pair_counts_active[p]
             # New pairs
             for j in range(len(new_word_tuple) - 1):
                 p = (new_word_tuple[j], new_word_tuple[j+1])
-                pair_counts[p] += freq
-
+                old_count = pair_counts_active.get(p, 0)
+                new_count = old_count + freq
+                pair_counts_active[p] = new_count
+                heapq.heappush(pair_heap, (-new_count, p))
+        
     return vocab, merges
 
 if __name__ == "__main__":

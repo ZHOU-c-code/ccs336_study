@@ -256,7 +256,7 @@ def train_bpe_tokenizer(
     return vocab, merges
 
 if __name__ == "__main__":
-    train_txt_path = r"E:\桌面\cs336\assignment1-basics-main\data\TinyStoriesV2-GPT4-train.txt"
+    train_txt_path = "..\data\TinyStoriesV2-GPT4-train.txt"
     vocab_size = 500
     special_tokens = ["<|endoftext|>"]
 

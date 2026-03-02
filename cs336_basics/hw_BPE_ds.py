@@ -22,16 +22,11 @@ TOKEN_PATTERN = re.compile(PAT, flags=re.UNICODE)
 def process_chunk_worker(args):
     """
     处理单个数据块的worker函数（模块级别，可pickle）
-    
-    Args:
-        args: (file_path, start, end, chunk_id, special_tokens)
-    
-    Returns:
-        该chunk中的token计数
+    现在返回 (token_counts, first_token, last_token, chunk_text)
     """
     file_path, start, end, chunk_id, special_tokens = args
     local_counts = defaultdict(int)
-    buffer_size = 1024 * 1024  # 1MB缓冲区
+    #buffer_size = 64 * 1024  #缓冲区
     
     # 预编译分割模式
     if special_tokens:
@@ -44,11 +39,11 @@ def process_chunk_worker(args):
         f.seek(start)
         remaining = end - start
         overflow = b''
-        
+        text = f.read(remaining).decode("utf-8",errors="ignore")
+        '''
         while remaining > 0:
             read_size = min(buffer_size, remaining)
-            data = f.read(read_size)
-            
+            data = f.read(read_size)            
             # 处理可能的UTF-8截断
             try:
                 text = (overflow + data).decode('utf-8')
@@ -67,8 +62,8 @@ def process_chunk_worker(args):
                 else:
                     text = (overflow + data).decode('utf-8', errors='ignore')
                     overflow = b''
-            
-            # 分割并tokenize
+
+            # 立即处理当前文本块 - 不保存到列表
             if delimiter_pattern:
                 segments = delimiter_pattern.split(text)
                 for segment in segments:
@@ -82,8 +77,24 @@ def process_chunk_worker(args):
                     token = match.group()
                     token_bytes = token.encode('utf-8')
                     local_counts[token_bytes] += 1
-            
-            remaining -= read_size
+            #remaining -= read_size
+            '''
+        if delimiter_pattern:
+                segments = delimiter_pattern.split(text)
+                for segment in segments:
+                    if segment:
+                        for match in TOKEN_PATTERN.finditer(segment):
+                            token = match.group()
+                            token_bytes = token.encode('utf-8')
+                            local_counts[token_bytes] += 1
+        else:
+            for match in TOKEN_PATTERN.finditer(text):
+                token = match.group()
+                token_bytes = token.encode('utf-8')
+                local_counts[token_bytes] += 1
+        # 获取首尾token（如果有）
+        #first_token = all_tokens[0] if all_tokens else None
+        #last_token = all_tokens[-1] if all_tokens else None
     
     return dict(local_counts)
 
@@ -223,7 +234,7 @@ def find_chunk_boundaries(
                     boundaries[i] = found
             
             return sorted(set(boundaries))
-
+        
 def process_chunks_parallel(
     file_path: str,
     boundaries: List[int],
@@ -231,18 +242,8 @@ def process_chunks_parallel(
     num_processes: int
 ) -> List[Dict[bytes, int]]:
     """
-    并行处理所有chunks
-    
-    Args:
-        file_path: 文件路径
-        boundaries: chunk边界
-        special_tokens: 特殊token列表
-        num_processes: 进程数
-    
-    Returns:
-        所有chunk的处理结果
+    并行处理所有chunks，返回计数结果列表、首尾token列表和每个块的完整文本
     """
-    # 准备chunk参数
     chunk_args = []
     for i in range(len(boundaries) - 1):
         chunk_args.append((
@@ -253,12 +254,13 @@ def process_chunks_parallel(
             special_tokens
         ))
     
-    # 并行处理
     with mp.Pool(processes=num_processes) as pool:
-        # 使用imap_unordered实现负载均衡
-        results = []
-        for result in pool.imap_unordered(process_chunk_worker, chunk_args):
-            results.append(result)
+        results = list(pool.imap_unordered(process_chunk_worker, chunk_args))
+    
+    # 分离结果
+    #counts_list = [r[0] for r in results]
+    #boundary_tokens = [(r[1], r[2]) for r in results]
+    #chunk_texts = [r[3] for r in results]
     
     return results
 
@@ -413,8 +415,14 @@ def run_train_bpe(
         phase_start = time.time()
         print("Phase 2: Processing chunks in parallel...")
     
-    chunk_results = process_chunks_parallel(str(input_path), boundaries, special_tokens, num_processes)
-    
+    chunk_results= process_chunks_parallel(str(input_path), boundaries, special_tokens, num_processes)
+    '''
+    for i, text in enumerate(chunk_texts):
+        preview_start = text[:100].replace('\n', '\\n')
+        preview_end = text[-100:].replace('\n', '\\n')
+        print(f"\nChunk {i} start: {preview_start}")
+        print(f"Chunk {i} end: {preview_end}")
+    '''
     if verbose:
         print(f"  Completed in {time.time() - phase_start:.2f}s")
     
@@ -579,14 +587,16 @@ def main():
     import pstats
     
     # 配置
-    #train_txt_path = "../data/TinyStoriesV2-GPT4-train.txt"
-    train_txt_path = "../tests/fixtures/tinystories_sample_5M.txt"
-    vocab_size = 1000
+    train_txt_path = "../data/TinyStoriesV2-GPT4-train.txt"
+    #train_txt_path = r"../tests/fixtures/tinystories_sample_5M.txt"
+    
+    vocab_size = 500
     special_tokens = ["<|endoftext|>"]
     
     # 性能分析
     pr = cProfile.Profile()
     pr.enable()
+    
     
     # 训练 - 使用符合测试接口的函数
     vocab, merges = run_train_bpe(

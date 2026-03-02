@@ -136,13 +136,20 @@ class PriorityQueue:
         self.REMOVED = '<removed>'
         self.counter = 0
     
+    def _get_descending_key(self, pair: Tuple[bytes, bytes]) -> tuple:
+        """将pair转换为降序排序的键"""
+        # 将每个字节取负实现降序
+        key1 = tuple(-b for b in pair[0]) + (0,) if pair[0] else (0,)
+        key2 = tuple(-b for b in pair[1]) + (0,) if pair[1] else (0,)
+        return (key1, key2)
+    
     def add_or_update(self, pair: Tuple[bytes, bytes], count: int):
         """添加或更新pair的优先级"""
         if count <= 0:
             self.remove(pair)
             return
-        
-        entry = [-count, self.counter, pair]
+        desc_key = self._get_descending_key(pair)
+        entry = [-count, desc_key, self.counter, pair]
         self.counter += 1
         
         if pair in self.entry_finder:
@@ -161,7 +168,7 @@ class PriorityQueue:
     def pop_max(self) -> Tuple[Optional[Tuple[bytes, bytes]], int]:
         """弹出最大频率的pair"""
         while self.heap:
-            neg_count, _, pair = heapq.heappop(self.heap)
+            neg_count, desc_key, counter, pair = heapq.heappop(self.heap)
             if pair != self.REMOVED:
                 del self.entry_finder[pair]
                 return pair, -neg_count
@@ -394,7 +401,7 @@ def run_train_bpe(
         print(f"Phase 1: Chunking file with {num_processes} processes...")
     
     split_token = b"<|endoftext|>" if "<|endoftext|>" in special_tokens else None
-    num_chunks = num_processes * 4  # 更多小块以便负载均衡
+    num_chunks = num_processes # 更多小块以便负载均衡
     
     boundaries = find_chunk_boundaries(str(input_path), num_chunks, split_token)
     
@@ -445,11 +452,13 @@ def run_train_bpe(
             pq.add_or_update(pair, count)
     
     # 复制word_counts用于更新
-    current_words = dict(word_counts)
+    current_words_tuple = {}
+    for word_bytes, freq in word_counts.items():
+        # 将 bytes 转换为 tuple of single-byte bytes
+        word_tuple = tuple(word_bytes[i:i+1] for i in range(len(word_bytes)))
+        current_words_tuple[word_tuple] = freq
     merges = []
-    
     merge_count = 0
-    heap_rebuild_interval = 1000
     
     while len(vocab) < vocab_size:
         best_pair, count = pq.pop_max()
@@ -466,52 +475,78 @@ def run_train_bpe(
         vocab[next_id] = new_token
         vocab_set.add(new_token)
         next_id += 1
+        #merges.append((token1, token2,count))
         merges.append((token1, token2))
-        
         merge_count += 1
         
-        # 找到包含这个pair的所有单词
-        words_to_update = []
-        token_pair = token1 + token2
-        
-        for word_bytes, freq in list(current_words.items()):
-            if freq > 0 and token_pair in word_bytes:
-                words_to_update.append((word_bytes, freq))
-        
         # 更新受影响的单词
-        for word_bytes, freq in words_to_update:
-            # 执行替换
-            new_word_bytes = word_bytes.replace(token_pair, new_token)
-            
-            if new_word_bytes == word_bytes:
+        words_to_update = []
+        for word_tuple, freq in current_words_tuple.items():
+            if freq == 0:
                 continue
-            
-            # 更新当前单词计数
-            current_words[word_bytes] -= freq
-            if current_words[word_bytes] == 0:
-                del current_words[word_bytes]
-            
-            current_words[new_word_bytes] = current_words.get(new_word_bytes, 0) + freq
+            # 检查是否包含这个 pair
+            for i in range(len(word_tuple) - 1):
+                if word_tuple[i] == token1 and word_tuple[i+1] == token2:
+                    words_to_update.append((word_tuple, freq))
+                    break  # 找到一个即可
         
-        # 定期重建优先队列以保持一致性
-        if merge_count % heap_rebuild_interval == 0:
-            # 重新计算所有pairs
-            new_pair_counts = defaultdict(int)
-            for word_bytes, freq in current_words.items():
-                if len(word_bytes) <= 1:
-                    continue
-                for i in range(len(word_bytes) - 1):
-                    pair = (word_bytes[i:i+1], word_bytes[i+1:i+2])
-                    new_pair_counts[pair] += freq
+        # 如果没有词包含这个pair，继续下一个
+        if not words_to_update:
+            continue
+        
+        # 批量更新
+        word_updates = defaultdict(int)  # {word_tuple: delta}
+        pair_updates = defaultdict(int)  # {pair: delta}
+        
+        for word_tuple, freq in words_to_update:
+            # 1. 记录旧词产生的所有pairs（要删除）
+            for i in range(len(word_tuple) - 1):
+                old_pair = (word_tuple[i], word_tuple[i+1])
+                pair_updates[old_pair] -= freq
             
-            # 重建优先队列
-            pq = PriorityQueue()
-            for pair, count in new_pair_counts.items():
-                if count > 0:
-                    pq.add_or_update(pair, count)
+            # 2. 构建新词（在 token 层面合并）
+            new_word = []
+            i = 0
+            word_len = len(word_tuple)
             
-            if verbose and merge_count % (heap_rebuild_interval * 10) == 0:
-                print(f"  Merges completed: {merge_count}, vocabulary size: {len(vocab)}")
+            while i < word_len:
+                if i < word_len - 1 and word_tuple[i] == token1 and word_tuple[i+1] == token2:
+                    new_word.append(new_token)
+                    i += 2
+                else:
+                    new_word.append(word_tuple[i])
+                    i += 1
+            
+            new_word_tuple = tuple(new_word)
+            
+            # 3. 记录新词产生的所有pairs（要添加）
+            for i in range(len(new_word_tuple) - 1):
+                new_pair = (new_word_tuple[i], new_word_tuple[i+1])
+                pair_updates[new_pair] += freq
+            
+            # 4. 记录word_counts的更新
+            word_updates[word_tuple] -= freq
+            word_updates[new_word_tuple] += freq
+        
+        # 批量应用 word_counts 更新
+        for word_tuple, delta in word_updates.items():
+            new_freq = current_words_tuple.get(word_tuple, 0) + delta
+            if new_freq > 0:
+                current_words_tuple[word_tuple] = new_freq
+            else:
+                if word_tuple in current_words_tuple:
+                    del current_words_tuple[word_tuple]
+        
+        # 批量应用 pair_counts 更新
+        for pair, delta in pair_updates.items():
+            new_count = pair_counts.get(pair, 0) + delta
+            if new_count > 0:
+                pair_counts[pair] = new_count
+                pq.add_or_update(pair, new_count)
+            else:
+                if pair in pair_counts:
+                    del pair_counts[pair]
+                pq.remove(pair)      
     
     if verbose:
         print(f"  Completed {merge_count} merges in {time.time() - phase_start:.2f}s")
@@ -544,8 +579,9 @@ def main():
     import pstats
     
     # 配置
-    train_txt_path = "../data/TinyStoriesV2-GPT4-valid.txt"
-    vocab_size = 500
+    #train_txt_path = "../data/TinyStoriesV2-GPT4-train.txt"
+    train_txt_path = "../tests/fixtures/tinystories_sample_5M.txt"
+    vocab_size = 1000
     special_tokens = ["<|endoftext|>"]
     
     # 性能分析
@@ -586,14 +622,14 @@ def main():
     
     # 打印前10个合并操作作为示例
     print("\nFirst 10 merges:")
-    for i, (t1, t2) in enumerate(merges[:10]):
+    for i, (t1, t2, count) in enumerate(merges[570:590]):
         try:
             t1_str = t1.decode('utf-8')
             t2_str = t2.decode('utf-8')
         except:
             t1_str = str(t1)
             t2_str = str(t2)
-        print(f"  Merge {i+1}: {t1_str} + {t2_str}")
+        print(f"  Merge {i+1}: {t1_str} + {t2_str}, {count}")
 
 
 if __name__ == "__main__":

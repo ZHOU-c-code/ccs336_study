@@ -9,6 +9,19 @@ import heapq
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
+def preload_file(input_path, boundaries):
+    """预先将整个文件读入内存"""
+    with open(input_path, 'rb') as f:
+        full_data = f.read()
+    
+    chunks_data = []
+    for i in range(len(boundaries) - 1):
+        start = boundaries[i]
+        end = boundaries[i+1]
+        chunks_data.append(full_data[start:end])
+    
+    return chunks_data
+
 def find_chunk_boundaries(
     file,
     desired_num_chunks: int,
@@ -52,9 +65,7 @@ def find_chunk_boundaries(
     return sorted(set(chunk_boundaries))
 
 def process_chunk(
-    file_path: str,
-    start: int,
-    end: int,
+    chunk_data: bytes,
     chunk_id: int,
     special_tokens: List[str],
     pat: str
@@ -71,15 +82,13 @@ def process_chunk(
     token_pattern = re.compile(pat, flags=re.UNICODE)
     pretoken_counts = Counter()
 
-    with open(file_path, 'rb') as f:
-        f.seek(start)
-        chunk_data = f.read(end - start).decode("utf-8", errors="ignore")
+    chunk_text = chunk_data.decode("utf-8", errors="ignore")
 
     if delimiter_pattern:
-        segments = delimiter_pattern.split(chunk_data)
+        segments = delimiter_pattern.split(chunk_text)
         full_segments = [seg for seg in segments if seg]
     else:
-        full_segments = [chunk_data]
+        full_segments = [chunk_text]
 
     for segment in full_segments:
         for match in token_pattern.finditer(segment):
@@ -140,9 +149,10 @@ def train_bpe_tokenizer(
     # Step 3: Initial parallel processing to get token positions        
     #print("Initial tokenization and pair counting...")
     # Process chunks to get initial token sequences and pair positions
+    chunks_data = preload_file(input_path, boundaries)
     with mp.Pool(processes=num_processes) as pool:
-        chunk_args = [(input_path, boundaries[i], boundaries[i+1], i, special_tokens, PAT)
-                      for i in range(len(boundaries) - 1)]
+        chunk_args = [(chunks_data[i], i, special_tokens, PAT)
+                      for i in range(len(chunks_data))]
         results = pool.starmap(process_chunk, chunk_args)
 
     word_counts = Counter()

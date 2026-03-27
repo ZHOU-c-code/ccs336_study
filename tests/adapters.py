@@ -8,8 +8,19 @@ import numpy.typing as npt
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
+from einops import rearrange
 from cs336_basics.BPE_training.hw_BPE_v3 import train_bpe_tokenizer
 from cs336_basics.BPE_encoder_decoder.tokenizer import Tokenizer
+from cs336_basics.transformer.linear import Linear
+from cs336_basics.transformer.embedding import Embedding
+from cs336_basics.transformer.rmsnorm import RMSNorm
+from cs336_basics.transformer.pw_ff import SwiGLU
+from cs336_basics.transformer.rope import RoPE
+from cs336_basics.transformer.softmax import Softmax
+from cs336_basics.transformer.attention import Attention
+from cs336_basics.transformer.multihead_self_attention import CausalMultiHeadSelfAttention
+from cs336_basics.transformer.transformer_block import TransformerBlock
+from cs336_basics.transformer.LM import TransformerLM
 
 def run_linear(
     d_in: int,
@@ -29,7 +40,16 @@ def run_linear(
     Returns:
         Float[Tensor, "... d_out"]: The transformed output of your linear module.
     """
-
+    linear = Linear(d_in, d_out, device=None, dtype=None)
+    
+    # 确保权重与模块的设备/类型一致（load_state_dict 会自动处理，但显式转换更安全）
+    #weights = weights.to(device=in_features.device, dtype=in_features.dtype)
+    
+    # 加载权重（参数名必须为 'W'，与 Linear 类中定义的 Parameter 名称一致）
+    linear.load_state_dict({'W': weights})
+    
+    # 前向传播
+    return linear(in_features)
     raise NotImplementedError
 
 
@@ -51,7 +71,16 @@ def run_embedding(
     Returns:
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
-
+    Embeddings = Embedding(vocab_size, d_model, device=None, dtype=None)
+    
+    # 确保权重与模块的设备/类型一致（load_state_dict 会自动处理，但显式转换更安全）
+    #weights = weights.to(device=in_features.device, dtype=in_features.dtype)
+    
+    # 加载权重（参数名必须为 'W'，与 Linear 类中定义的 Parameter 名称一致）
+    Embeddings.load_state_dict({'embedding_matrix': weights})
+    
+    # 前向传播
+    return Embeddings(token_ids)
     raise NotImplementedError
 
 
@@ -84,6 +113,15 @@ def run_swiglu(
     # swiglu.w1.weight.data = w1_weight
     # swiglu.w2.weight.data = w2_weight
     # swiglu.w3.weight.data = w3_weight
+    swiglu = SwiGLU(d_model, d_ff)
+    state_dict = {
+        'W1.W': w1_weight,        
+        'W2.W': w2_weight,               
+        'W3.W': w3_weight,              
+    }
+
+    swiglu.load_state_dict(state_dict)
+    return swiglu(in_features)
     raise NotImplementedError
 
 
@@ -105,6 +143,7 @@ def run_scaled_dot_product_attention(
     Returns:
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
+    return Attention(Q,K,V,mask)
     raise NotImplementedError
 
 
@@ -139,6 +178,34 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
+    def expand_to_full(weight, d_model, num_heads):
+        """如果 weight 形状是 (d_k, d_model)，则重复 num_heads 次得到 (d_model, d_model)"""
+        if weight.shape[0] == d_model:
+            return weight  # 已经是完整形状       
+        elif weight.shape[0] == d_model // num_heads:
+            # 重复每个头的权重（假设所有头共享同一权重）
+            return weight.repeat(num_heads, 1)
+        else:
+            raise ValueError(f"Unexpected weight shape: {weight.shape}")
+    q_full = expand_to_full(q_proj_weight, d_model, num_heads)
+    k_full = expand_to_full(k_proj_weight, d_model, num_heads)
+    v_full = expand_to_full(v_proj_weight, d_model, num_heads)
+    # 拼接成 combined_QKV 的权重，形状 (3*d_model, d_model)
+    # 注意：nn.Linear 的权重形状为 (out_features, in_features)
+    combined_weight = torch.cat([q_full, k_full, v_full], dim=0)  # (3*d_model, d_model)
+    if o_proj_weight.shape[0] != d_model or o_proj_weight.shape[1] != d_model:
+        # 假设也可能是 (d_model, d_k) 需要扩展？但通常输出投影是 (d_model, d_model)
+        # 这里简单处理，若形状为 (d_model, d_k)，则重复 num_heads 次
+        if o_proj_weight.shape == (d_model, d_model // num_heads):
+            o_proj_weight = o_proj_weight.repeat(1, num_heads)
+        else:
+            raise ValueError(f"Unexpected o_proj_weight shape: {o_proj_weight.shape}")
+        
+    model = CausalMultiHeadSelfAttention(d_model, num_heads, use_rope=False)
+    # 直接赋值权重（假设无偏置）
+    model.combined_QKV.W.data = combined_weight
+    model.W_O.W.data = o_proj_weight
+    return model(in_features)
     raise NotImplementedError
 
 
@@ -179,6 +246,34 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
+    def expand_to_full(weight, d_model, num_heads):
+        """如果 weight 形状是 (d_k, d_model)，则重复 num_heads 次得到 (d_model, d_model)"""
+        if weight.shape[0] == d_model:
+            return weight  # 已经是完整形状       
+        elif weight.shape[0] == d_model // num_heads:
+            # 重复每个头的权重（假设所有头共享同一权重）
+            return weight.repeat(num_heads, 1)
+        else:
+            raise ValueError(f"Unexpected weight shape: {weight.shape}")
+    q_full = expand_to_full(q_proj_weight, d_model, num_heads)
+    k_full = expand_to_full(k_proj_weight, d_model, num_heads)
+    v_full = expand_to_full(v_proj_weight, d_model, num_heads)
+    # 拼接成 combined_QKV 的权重，形状 (3*d_model, d_model)
+    # 注意：nn.Linear 的权重形状为 (out_features, in_features)
+    combined_weight = torch.cat([q_full, k_full, v_full], dim=0)  # (3*d_model, d_model)
+    if o_proj_weight.shape[0] != d_model or o_proj_weight.shape[1] != d_model:
+        # 假设也可能是 (d_model, d_k) 需要扩展？但通常输出投影是 (d_model, d_model)
+        # 这里简单处理，若形状为 (d_model, d_k)，则重复 num_heads 次
+        if o_proj_weight.shape == (d_model, d_model // num_heads):
+            o_proj_weight = o_proj_weight.repeat(1, num_heads)
+        else:
+            raise ValueError(f"Unexpected o_proj_weight shape: {o_proj_weight.shape}")
+        
+    model = CausalMultiHeadSelfAttention(d_model, num_heads, theta, max_seq_len,use_rope=True)
+    # 直接赋值权重（假设无偏置）
+    model.combined_QKV.W.data = combined_weight
+    model.W_O.W.data = o_proj_weight
+    return model(in_features, token_positions)
     raise NotImplementedError
 
 
@@ -201,6 +296,9 @@ def run_rope(
     Returns:
         Float[Tensor, " ... sequence_length d_k"]: Tensor with RoPEd input.
     """
+    rope = RoPE(theta, d_k, max_seq_len)
+    return rope(in_query_or_key,token_positions)
+
     raise NotImplementedError
 
 
@@ -273,8 +371,32 @@ def run_transformer_block(
     Returns:
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
-    """
-    raise NotImplementedError
+    """  
+    # 创建 TransformerBlock 实例
+    model = TransformerBlock(d_model, num_heads, d_ff, theta, max_seq_len)
+    
+    # 构建状态字典
+    # 拼接 QKV 权重
+    q_proj_weight = weights['attn.q_proj.weight']
+    k_proj_weight = weights['attn.k_proj.weight']
+    v_proj_weight = weights['attn.v_proj.weight']
+    combined_weight = torch.cat([q_proj_weight, k_proj_weight, v_proj_weight], dim=0)  # (3*d_model, d_model)
+    
+    state_dict = {
+        'norm1.gain': weights['ln1.weight'],
+        'attn.combined_QKV.W': combined_weight,
+        'attn.W_O.W': weights['attn.output_proj.weight'],
+        'norm2.gain': weights['ln2.weight'],
+        'ff.W1.W': weights['ffn.w1.weight'],
+        'ff.W2.W': weights['ffn.w2.weight'],
+        'ff.W3.W': weights['ffn.w3.weight'],
+    }
+    
+    # 加载权重
+    model.load_state_dict(state_dict)
+    
+    # 前向传播
+    return model(in_features)
 
 
 def run_transformer_lm(
@@ -356,6 +478,45 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
+    model = TransformerLM(
+        vocab_size=vocab_size,
+        context_length=context_length,
+        d_model=d_model,
+        num_heads=num_heads,
+        d_ff=d_ff,
+        num_layers=num_layers,
+        rope_theta=rope_theta,
+    )
+
+    # 2. 转换权重字典的键以匹配模型参数名
+    state_dict = {}
+
+    # 2.1 词向量和输出层
+    state_dict["token_embedding.embedding_matrix"] = weights["token_embeddings.weight"]
+    state_dict["final_norm.gain"] = weights["ln_final.weight"]
+    state_dict["lm_head.W"] = weights["lm_head.weight"]
+
+    # 2.2 每层 Transformer 权重
+    for layer_idx in range(num_layers):
+        layer_prefix = f"layers.{layer_idx}"
+        block_prefix = f"blocks.{layer_idx}"
+
+        q = weights[f"{layer_prefix}.attn.q_proj.weight"]
+        k = weights[f"{layer_prefix}.attn.k_proj.weight"]
+        v = weights[f"{layer_prefix}.attn.v_proj.weight"]
+        state_dict[f"{block_prefix}.attn.combined_QKV.W"] = torch.cat([q, k, v], dim=0)
+
+        state_dict[f"{block_prefix}.attn.W_O.W"] = weights[f"{layer_prefix}.attn.output_proj.weight"]
+        state_dict[f"{block_prefix}.norm1.gain"] = weights[f"{layer_prefix}.ln1.weight"]
+        state_dict[f"{block_prefix}.norm2.gain"] = weights[f"{layer_prefix}.ln2.weight"]
+        state_dict[f"{block_prefix}.ff.W1.W"] = weights[f"{layer_prefix}.ffn.w1.weight"]
+        state_dict[f"{block_prefix}.ff.W2.W"] = weights[f"{layer_prefix}.ffn.w2.weight"]
+        state_dict[f"{block_prefix}.ff.W3.W"] = weights[f"{layer_prefix}.ffn.w3.weight"]
+
+    # 3. 加载权重
+    model.load_state_dict(state_dict)
+
+    return model(in_indices)
     raise NotImplementedError
 
 
@@ -379,6 +540,16 @@ def run_rmsnorm(
         Float[Tensor,"... d_model"]: Tensor of with the same shape as `in_features` with the output of running
         RMSNorm of the `in_features`.
     """
+    RMSnorm = RMSNorm(d_model, eps, device=None, dtype=None)
+    
+    # 确保权重与模块的设备/类型一致（load_state_dict 会自动处理，但显式转换更安全）
+    #weights = weights.to(device=in_features.device, dtype=in_features.dtype)
+    
+    # 加载权重（参数名必须为 'W'，与 Linear 类中定义的 Parameter 名称一致）
+    RMSnorm.load_state_dict({'gain': weights})
+    
+    # 前向传播
+    return RMSnorm(in_features)
     raise NotImplementedError
 
 
@@ -432,6 +603,7 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
         Float[Tensor, "..."]: Tensor of with the same shape as `in_features` with the output of
         softmax normalizing the specified `dim`.
     """
+    return Softmax(in_features, dim)
     raise NotImplementedError
 
 
